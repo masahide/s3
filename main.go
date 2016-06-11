@@ -2,17 +2,18 @@ package main
 
 import (
 	"compress/gzip"
+	"crypto/md5"
+	"encoding/base64"
+	"encoding/hex"
 	"flag"
 	"fmt"
 	"io"
 	"log"
-	"net/http"
 	"os"
 	"path"
 	"path/filepath"
 	"runtime"
 	"strings"
-	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/session"
@@ -20,11 +21,10 @@ import (
 )
 
 var (
-	LogLevel     = 0
-	Region       = "ap-northeast-1"
-	Bucket       = ""
-	Acl          = "private"
-	MimeType     = "application/octet-stream"
+	region       = "ap-northeast-1"
+	bucket       = ""
+	acl          = "private"
+	mimeType     = "application/octet-stream"
 	changedRc    = 254
 	failedRc     = 255
 	okRc         = 0
@@ -50,6 +50,89 @@ func showHelp() {
 	//fmt.Println("  grep bucket/path/to")
 }
 
+type s3DlParam struct {
+	S3 *s3.S3
+	s3.GetObjectInput
+	dest   string
+	mkdir  bool
+	dryrun bool
+}
+
+type s3UpParam struct {
+	s3.PutObjectInput
+	S3     *s3.S3
+	src    string
+	dryrun bool
+}
+
+func uploadFileD(S3 *s3.S3, req *s3.PutObjectInput) (*s3.PutObjectInput, *s3.PutObjectOutput, error) {
+
+	md5hex, _, _, err := md5Sum(req.Body)
+	if err != nil {
+		return nil, nil, err
+	}
+	res, err := S3.PutObject(req)
+	if err != nil {
+		log.Printf("bucket.Put err:%v", err)
+		return req, res, err
+	}
+	if res == nil {
+		return req, res, fmt.Errorf("res is nil pointer")
+	}
+	if res.ETag == nil {
+		return req, res, fmt.Errorf("res.ETag is nil pointer")
+	}
+	if len(*res.ETag) < 2 {
+		return req, res, fmt.Errorf("*res.ETag is too short. It should have 2 characters or more")
+	}
+	etag := (*res.ETag)[1 : len(*res.ETag)-1]
+	if md5hex != etag {
+		return req, res, fmt.Errorf("md5 and ETag does not match. md5:%s ETag:%s", md5hex, etag)
+	}
+	return req, res, err
+}
+
+func md5Sum(r io.ReadSeeker) (md5hex string, md5b64 string, size int64, err error) {
+	var offset int64
+	offset, err = r.Seek(0, os.SEEK_CUR)
+	if err != nil {
+		return
+	}
+	defer r.Seek(offset, os.SEEK_SET)
+	digest := md5.New()
+	size, err = io.Copy(digest, r)
+	if err != nil {
+		return
+	}
+	sum := digest.Sum(nil)
+	md5hex = hex.EncodeToString(sum)
+	md5b64 = base64.StdEncoding.EncodeToString(sum)
+	return
+}
+func listObjectsCallBack(S3 *s3.S3, req *s3.ListObjectsInput, dirCb func(*s3.CommonPrefix) error, objectCb func(*s3.Object) error) error {
+	for {
+		l, err := S3.ListObjects(req)
+		if err != nil {
+			return err // give up retry.
+		}
+		for _, cp := range l.CommonPrefixes {
+			if err := dirCb(cp); err != nil {
+				return err
+			}
+		}
+		for _, object := range l.Contents {
+			if err := objectCb(object); err != nil {
+				return err
+			}
+		}
+		if !aws.BoolValue(l.IsTruncated) {
+			return nil
+		}
+		req.Marker = l.NextMarker
+	}
+	return nil
+}
+
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 
@@ -57,16 +140,15 @@ func main() {
 		fmt.Printf("version: %s\n", version)
 		return
 	}
-	flag.IntVar(&LogLevel, "d", LogLevel, "LogLevel: 0-4")
 	flag.IntVar(&changedRc, "rc_changed", changedRc, "changed return code")
 	flag.IntVar(&failedRc, "rc_failed", failedRc, "failed return code")
 	flag.IntVar(&okRc, "rc_ok", okRc, "OK return code")
 	flag.BoolVar(&show_version, "version", false, "show version")
 	flag.BoolVar(&fullpath, "fullpath", false, "show fullpath")
-	flag.StringVar(&Region, "Region", Region, "Region")
+	flag.StringVar(&region, "Region", region, "Region")
 	flag.StringVar(&profile, "p", profile, "profile name")
-	flag.StringVar(&Acl, "ACL", Acl, "ACL of upload file")
-	flag.StringVar(&MimeType, "MimeType", MimeType, "MimeType of upload file")
+	flag.StringVar(&acl, "ACL", acl, "ACL of upload file")
+	flag.StringVar(&mimeType, "MimeType", mimeType, "MimeType of upload file")
 	flag.BoolVar(&preCheck, "precheck", preCheck, "pre-check mode")
 	flag.BoolVar(&dryrun, "dry", dryrun, "dryrun mode")
 	flag.Parse()
@@ -78,16 +160,6 @@ func main() {
 	}
 
 	runtime.GOMAXPROCS(runtime.NumCPU())
-
-	httpClient := &http.Client{
-		Transport: &http.Transport{
-			//MaxIdleConnsPerHost:   config.WorkNum + 1,
-			TLSHandshakeTimeout:   time.Duration(5) * time.Second,
-			ResponseHeaderTimeout: time.Duration(5) * time.Second,
-			DisableCompression:    true,
-		},
-		Timeout: time.Duration(5) * time.Second,
-	}
 
 	var err error
 
@@ -101,7 +173,7 @@ func main() {
 		showHelp()
 		return
 	}
-	S3 := s3.New(session.New(), &aws.Config{Region: aws.String(Region)})
+	S3 := s3.New(session.New(), &aws.Config{Region: aws.String(region)})
 	if err = cmd(S3, params); err != nil {
 		log.Printf("%s", err)
 		os.Exit(1)
@@ -125,7 +197,7 @@ func dl(S3 *s3.S3, params []string) error {
 	}
 
 	path := strings.Split(params[0], "/")
-	bucket := path[0]
+	bucket = path[0]
 	dest := "."
 	if len(params) >= 2 {
 		dest = params[1]
@@ -162,8 +234,11 @@ func dl(S3 *s3.S3, params []string) error {
 		return err
 	}
 	cs, err := s3Download(s3DlParam{
-		S3:     S3,
-		src:    key,
+		S3: S3,
+		GetObjectInput: s3.GetObjectInput{
+			Bucket: &bucket,
+			Key:    &key,
+		},
 		dest:   filepath.Join(destpath, destfilename),
 		mkdir:  true,
 		dryrun: dryrun,
@@ -211,7 +286,7 @@ func getObject(S3 *s3.S3, params []string) (io.ReadCloser, error) {
 	}
 
 	path := strings.Split(params[0], "/")
-	bucket := path[0]
+	bucket = path[0]
 	if len(path) == 0 {
 		return nil, fmt.Errorf("path is unknown.")
 	}
@@ -233,7 +308,7 @@ func up(S3 *s3.S3, params []string) error {
 	}
 
 	path := strings.Split(params[1], "/")
-	bucket := path[0]
+	bucket = path[0]
 	key := strings.TrimPrefix(params[1], bucket+"/")
 	if bucket == key {
 		key = ""
@@ -255,15 +330,26 @@ func up(S3 *s3.S3, params []string) error {
 			return err
 		}
 		defer f.Close()
-		return S3.UploadFile(key, f, MimeType, Acl)
+		req := &s3.PutObjectInput{
+			ACL:    &acl,
+			Body:   f,
+			Bucket: &bucket,
+			//ContentLength: &size,
+			ContentType: &mimeType,
+			Key:         &key,
+		}
+		_, _, err = uploadFileD(S3, req)
+		return err
 	}
 	cs, err := s3Upload(s3UpParam{
-		S3:          S3,
-		src:         srcfilename,
-		dest:        key,
-		perm:        Acl, // public-read-write, public-read, private
-		contentType: MimeType,
-		dryrun:      dryrun,
+		S3:  S3,
+		src: srcfilename,
+		PutObjectInput: s3.PutObjectInput{
+			Key:         &key,
+			ACL:         &acl, // public-read-write, public-read, private
+			ContentType: &mimeType,
+		},
+		dryrun: dryrun,
 	})
 	printChecksum(cs)
 	if err != nil {
@@ -300,7 +386,7 @@ func ls(S3 *s3.S3, params []string) error {
 		Delimiter: aws.String("/"),
 		Prefix:    &prefix,
 	}
-	err := S3.ListObjectsCallBack(req, func(cp *s3.CommonPrefix) error {
+	err := listObjectsCallBack(S3, req, func(cp *s3.CommonPrefix) error {
 		printPath(*cp.Prefix)
 		return nil
 	}, func(o *s3.Object) error {
@@ -324,28 +410,11 @@ func printPath(p string) {
 }
 
 func listBucket(S3 *s3.S3) error {
-	res, err := S3.ListBuckets()
+	res, err := S3.ListBuckets(&s3.ListBucketsInput{})
 	for _, b := range res.Buckets {
 		fmt.Println(*b.Name)
 	}
 	return err
-}
-
-type s3DlParam struct {
-	S3     *s3.S3
-	src    string
-	dest   string
-	mkdir  bool
-	dryrun bool
-}
-
-type s3UpParam struct {
-	S3          *s3.S3
-	src         string
-	dest        string
-	perm        string // public-read-write, public-read, private
-	contentType string
-	dryrun      bool
 }
 
 type checksum struct {
@@ -356,11 +425,11 @@ type checksum struct {
 }
 
 func s3UploadCheck(s s3UpParam) (checksum, error) {
-	return checkMD5(s.S3, s.src, s.dest)
+	return checkMD5(s.S3, s.src, *s.Bucket, *s.Key)
 }
 
 func s3downloadCheck(s s3DlParam) (checksum, error) {
-	return checkMD5(s.S3, s.dest, s.src)
+	return checkMD5(s.S3, s.dest, *s.Bucket, *s.Key)
 }
 
 func s3Upload(s s3UpParam) (checksum, error) {
@@ -374,10 +443,10 @@ func s3Upload(s s3UpParam) (checksum, error) {
 	}
 	defer f.Close()
 	var po *s3.PutObjectOutput
-	if s.contentType == "" {
-		s.contentType = "application/octet-stream"
+	if *s.ContentType == "" {
+		*s.ContentType = "application/octet-stream"
 	}
-	_, po, err = s.S3.UploadFileD(s.dest, f, s.contentType, s.perm)
+	_, po, err = uploadFileD(s.S3, &s.PutObjectInput)
 	if err != nil {
 		cs.changed = false
 		return cs, err
@@ -401,7 +470,7 @@ func fileExists(filename string) bool {
 	return err == nil
 }
 
-func checkMD5(s3 *s3.S3, src, dest string) (checksum, error) {
+func checkMD5(s3 *s3.S3, src, backet, key string) (checksum, error) {
 	if !fileExists(src) {
 		return checksum{changed: true}, nil
 	}
@@ -410,16 +479,16 @@ func checkMD5(s3 *s3.S3, src, dest string) (checksum, error) {
 		return checksum{}, err
 	}
 	defer f.Close()
-	return checks3md5(f, s3, dest)
+	return checks3md5(f, s3, bucket, key)
 }
-func checks3md5(f io.ReadSeeker, s *s3.S3, key string) (checksum, error) {
+func checks3md5(f io.ReadSeeker, s *s3.S3, bucket, key string) (checksum, error) {
 	var err error
 	res := checksum{}
-	res.localMd5hex, _, _, err = session.Md5Sum(f)
+	res.localMd5hex, _, _, err = md5Sum(f)
 	if err != nil {
 		return res, err
 	}
-	if r, err := s.HeadObject(&s3.HeadObjectInput{Bucket: &s.Bucket, Key: &key}); err == nil {
+	if r, err := s.HeadObject(&s3.HeadObjectInput{Bucket: &bucket, Key: &key}); err == nil {
 		if len(*r.ETag) < 3 {
 			return res, fmt.Errorf("ETag  is too short. etag:%s", r.ETag)
 		}
@@ -446,11 +515,7 @@ func s3Download(s s3DlParam) (checksum, error) {
 		}
 	}
 
-	req := &s3.GetObjectInput{
-		Bucket: &s.bucket,
-		Key:    &s.src,
-	}
-	resGetObj, err := s.S3.GetObject(req)
+	resGetObj, err := s.S3.GetObject(&s.GetObjectInput)
 	if err != nil {
 		return cs, err
 	}
