@@ -28,5 +28,5 @@ deployment:
      - gox --osarch "linux/amd64 darwin/amd64" -ldflags "-X main.Version=$(git describe --always --dirty) -X main.Date=$BUILD_DATE" -output "dist/{{.OS}}_{{.Arch}}/${CIRCLE_PROJECT_REPONAME}"
      - rm -rf arc
      - mkdir -p arc
-     - ls dist |xargs -n1 -I{} tar cvzf arc/${CIRCLE_PROJECT_REPONAME}.{}.tar.gz {} 
+     - ls dist |xargs -n1 -I{} tar -C dist -cvzf arc/${CIRCLE_PROJECT_REPONAME}.{}.tar.gz {}
      - ghr -t $GITHUB_TOKEN -u $CIRCLE_PROJECT_USERNAME -r $CIRCLE_PROJECT_REPONAME --replace `git describe --tags` arc/
